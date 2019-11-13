@@ -64,365 +64,439 @@ using namespace llvm::sys;
 using namespace llvm::sys::fs;
 using namespace llvm::object;
 using namespace std;
-static cl::opt<bool> DumpIR("dump-ir", cl::init(false),
-                                         cl::NotHidden,
-                                         cl::desc("Dump Obfuscated IR."));
-static cl::opt<string> OutputFilename("o", cl::desc("<output file>"),
-                                      cl::Required);
-static cl::opt<string> InputFilename("i", cl::desc("<input file>"),
-                                     cl::Required);
 
-static cl::opt<string> LDPath("ldpath", cl::init("/usr/bin/ld"),
-                              cl::desc("Path to LD"));
+static cl::opt<bool>
+DumpIR( "dump-ir", cl::init(false), cl::NotHidden, cl::desc("Dump Obfuscated IR."));
 static cl::opt<string>
-    SDKROOTPATH("sdkroot",
-                cl::init("/Applications/Xcode.app/Contents/Developer/Platforms/"
-                         "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"),
-                cl::desc("SDKROOT"));
+OutputFilename("o", cl::desc("<output file>"), cl::Required);
+static cl::opt<string>
+InputFilename("i", cl::desc("<input file>"), cl::Required);
+static cl::opt<string>
+LDPath("ldpath", cl::init("/usr/bin/ld"), cl::desc("Path to LD"));
+static cl::opt<string>
+SDKROOTPATH(
+		"sdkroot",
+		cl::init("/Applications/Xcode.app/Contents/Developer/Platforms/"
+				"iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"),
+				cl::desc("SDKROOT"));
 
-                #define VM(Name) errs() << "Verifying "<< Name << "...\n"; \
-                  bool dbgInfo; \
-                  if(verifyModule(module, &errs(), &dbgInfo)){ \
-                    SmallString<128> TmpModel; \
-                    path::system_temp_directory(true, TmpModel); \
-                    path::append(TmpModel, "HikariCrashTemporaryIR%%%%%.ll"); \
-                    int fd=-1; \
-                    SmallString<128> ResultPath; \
-                    std::error_code EC=fs::createUniqueFile(TmpModel,fd,ResultPath); \
-                    if(!EC && fd!=-1){ \
-                      raw_fd_ostream OS(fd,true); \
-                      ModulePass* PMP=createPrintModulePass(OS); \
-                      PMP->runOnModule(module); \
-                      delete PMP; \
-                      OS.flush(); \
-                      errs()<<"Written Crashed LLVM IR to:"<<ResultPath.str()<<"\n"; \
-                    } \
-                    else{ \
-                      errs()<<"Creating Temporary File Failed, ErroCode:"<<EC.message()<<"\n"; \
-                    } \
-                    abort(); \
-                  } \
+#define VM(Name) errs() << "Verifying "<< Name << "...\n"; \
+		bool dbgInfo; \
+		if(verifyModule(module, &errs(), &dbgInfo)){ \
+			SmallString<128> TmpModel; \
+			path::system_temp_directory(true, TmpModel); \
+			path::append(TmpModel, "HikariCrashTemporaryIR%%%%%.ll"); \
+			int fd=-1; \
+			SmallString<128> ResultPath; \
+			std::error_code EC=fs::createUniqueFile(TmpModel,fd,ResultPath); \
+			if(!EC && fd!=-1){ \
+				raw_fd_ostream OS(fd,true); \
+				ModulePass* PMP=createPrintModulePass(OS); \
+				PMP->runOnModule(module); \
+				delete PMP; \
+				OS.flush(); \
+				errs()<<"Written Crashed LLVM IR to:"<<ResultPath.str()<<"\n"; \
+			} \
+			else{ \
+				errs()<<"Creating Temporary File Failed, ErroCode:"<<EC.message()<<"\n"; \
+			} \
+			abort(); \
+		} \
 
-string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
-  if (MachO == nullptr) {
-    report_fatal_error(make_error<GenericBinaryError>("MachO is NULL!"), false);
-  }
-  string ret = "";
-  SMDiagnostic diag;
-  LLVMContext ctx;
-  bool foundBC = false;
-  bool foundCMD = false;
-  Module module("Noctilucence", ctx);
-  vector<StringRef> ldargs;
-  ldargs.push_back(argv[0]);
-  for (section_iterator iter = MachO->section_begin(), E = MachO->section_end();
-       iter != E; ++iter) {
-    SectionRef section = *iter;
-    StringRef sectionName;
-    StringRef segmentName =
-        MachO->getSectionFinalSegmentName(section.getRawDataRefImpl());
-    MachO->getSectionName(section.getRawDataRefImpl(), sectionName);
-    if (segmentName.equals("__LLVM") && sectionName.equals("__bundle")) {
-      foundBC = true;
-      foundCMD = true;
-      StringRef contents;
-      section.getContents(contents);
-      SmallString<128> TmpModel;
-      path::system_temp_directory(true, TmpModel);
-      path::append(TmpModel, "NoctilucenceTemporaryXAR%%%%%.xar");
-      Expected<TempFile> tfOrError = TempFile::create(TmpModel);
-      if (tfOrError) {
-        TempFile &tf = tfOrError.get();
-        raw_fd_ostream rf(tf.FD, false);
-        rf << contents;
-        rf.flush();
-        errs() << "Created xar temporary file at:" << tf.TmpName << "\n";
-        xar_t xar = xar_open(tf.TmpName.c_str(), READ);
-        xar_iter_t xi = xar_iter_new();
-        for (xar_file_t xf = xar_file_first(xar, xi); xf;
-             xf = xar_file_next(xi)) {
-          char *buffer = nullptr;
-          xar_extract_tobuffer(xar, xf, &buffer);
-          assert(buffer != nullptr && "xar extraction failed");
-          char *sizeStr = xar_get_size(xar, xf);
-          long int total = atol(sizeStr);
-          free(sizeStr);
 
-          MemoryBuffer *MB =
-              MemoryBuffer::getMemBuffer(StringRef(buffer, total), "", false)
-                  .get();
-          MemoryBufferRef MBR(*MB);
-          std::unique_ptr<Module> tmpModule = parseIR(MBR, diag, ctx);
-          assert(tmpModule.get() != nullptr && "Bitcode Parsing Failed!");
-          Linker::linkModules(module, std::move(tmpModule));
-          free(buffer);
-        }
 
-        for (xar_subdoc_t doc = xar_subdoc_first(xar); doc;
-             doc = xar_subdoc_next(doc)) {
-          if (strcmp("Ld", xar_subdoc_name(doc)) == 0) {
-            unsigned char *val = nullptr;
-            unsigned int size = 0;
-            xar_subdoc_copyout(doc, &val, &size);
-            string text((char *)val);
-            std::stringstream ss(text);
-            std::string to;
-            vector<char *> dylibs;
-            while (std::getline(ss, to, '\n')) {
-              if (to.find("<option>") != string::npos &&
-                  to.find("</option>") != string::npos) {
-                size_t s1 = to.find("<option>");
-                to.erase(s1, strlen("<option>"));
-                size_t s2 = to.find("</option>");
-                to.erase(s2, strlen("</option>"));
-                to.erase(std::remove(to.begin(), to.end(), ' '), to.end());
-                char *newT = (char *)calloc(to.size() + 1, sizeof(char));
-                to.copy(newT, to.size());
-                ldargs.push_back(newT);
-              } else if (to.find("<architecture>") != string::npos &&
-                         to.find("</architecture>") != string::npos) {
-                size_t s1 = to.find("<architecture>");
-                to.erase(s1, strlen("<architecture>"));
-                size_t s2 = to.find("</architecture>");
-                to.erase(s2, strlen("</architecture>"));
-                to.erase(std::remove(to.begin(), to.end(), ' '), to.end());
-                ldargs.push_back("-arch");
-                char *newT = (char *)calloc(to.size() + 1, sizeof(char));
-                to.copy(newT, to.size());
-                ldargs.push_back(newT);
-              } else if (to.find("<lib>") != string::npos &&
-                         to.find("</lib>") != string::npos) {
-                size_t s1 = to.find("<lib>");
-                to.erase(s1, strlen("<lib>"));
-                size_t s2 = to.find("</lib>");
-                to.erase(s2, strlen("</lib>"));
-                to.erase(std::remove(to.begin(), to.end(), ' '), to.end());
-                to.replace(to.find("{SDKPATH}"), strlen("{SDKPATH}"),
-                           SDKROOTPATH);
-                char *newT = (char *)calloc(to.size() + 1, sizeof(char));
-                to.copy(newT, to.size());
-                dylibs.push_back(newT);
-              }
-            }
-            for (char *dy : dylibs) {
-              ldargs.push_back(dy);
-            }
-            break;
-          }
-        }
+string HandleMachOObjFile  ( MachOObjectFile      *MachO, const char **argv ) ;
 
-        xar_close(xar);
-        Error err = tf.discard();
-        if (err) {
-          errs() << err << "\n";
-          abort();
-        }
-      } else {
-        errs() << "Creating xar temporary file failed:" << tfOrError.takeError()
-               << "\n";
-        abort();
-      }
-      break;
-    } else if (sectionName.equals("__bitcode")) {
-      foundBC = true;
-      StringRef contents;
-      section.getContents(contents);
-      MemoryBuffer *MB = MemoryBuffer::getMemBuffer(contents, "", false).get();
-      MemoryBufferRef MBR(*MB);
-      std::unique_ptr<Module> tmpModule = parseIR(MBR, diag, ctx);
-      assert(tmpModule.get() != nullptr && "Bitcode Parsing Failed!");
-      Linker::linkModules(module, std::move(tmpModule));
-    }
-  }
-  if (foundBC == false) {
-    errs() << "Bitcode not Found!\n";
-    abort();
-  }
-  errs()<<"Extracted Linker Flags:\n";
-  for(decltype(ldargs.size()) i=1;i<ldargs.size()-1;i++){
-    errs()<<ldargs[i]<<" ";
-  }
-  errs()<<"\n";
-  // TargetOptions's setup is by no mean complete, though
-  SmallString<128> TmpModel;
-  path::system_temp_directory(true, TmpModel);
-  path::append(TmpModel, "NoctilucenceTemporaryObject%%%%%%%.o");
-  Expected<TempFile> tfOrError = TempFile::create(TmpModel);
-  if (tfOrError) {
-    TempFile &tf = tfOrError.get();
-    errs() << "Created temporary object file placeholder at:" << tf.TmpName
-           << " with FD:" << tf.FD << "\n";
-    raw_fd_ostream rf(tf.FD, false);
-    Triple tri(module.getTargetTriple());
-    DataLayout dl(&module);
-    PassManagerBuilder PMB;
-    legacy::FunctionPassManager FPM(&module);
-    legacy::PassManager MPM;
-    PMB.populateFunctionPassManager(FPM);
-    PMB.populateModulePassManager(MPM);
-    for (auto &F : module) {
-      FPM.run(F);
-    }
-    MPM.run(module);
-    VM("Noctilucence")
-    if(DumpIR){
-        std::ofstream std_file_stream(OutputFilename+".ll");
-	      raw_os_ostream file_stream(std_file_stream);
-	      module.print(file_stream, nullptr);
-    }
-    std::string err;
-    string arch = "";
-    const Target *target = TargetRegistry::lookupTarget(tri.getTriple(), err);
-    if (target == nullptr) {
-      errs() << err << "\n";
-      exit(-1);
-    }
-    TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
-    Options.DisableIntegratedAS = false;
-    Options.MCOptions.ShowMCEncoding = false;
-    Options.MCOptions.MCUseDwarfDirectory = false;
-    Options.MCOptions.AsmVerbose = false;
-    Options.MCOptions.PreserveAsmComments = false;
-    Options.MCOptions.SplitDwarfFile = false;
-    std::unique_ptr<TargetMachine> Target(target->createTargetMachine(
-        tri.getTriple(), "", "", Options, getRelocModel(), getCodeModel(),
-        CodeGenOpt::Default));
-    assert(Target && "Could not allocate target machine!");
-    legacy::PassManager PM;
-    TargetLibraryInfoImpl TLII(tri);
-    PM.add(new TargetLibraryInfoWrapperPass(TLII));
-    LLVMTargetMachine &LLVMTM = static_cast<LLVMTargetMachine &>(*Target);
-    MachineModuleInfo *MMI = new MachineModuleInfo(&LLVMTM);
-    TargetPassConfig &TPC = *LLVMTM.createPassConfig(PM);
-    PM.add(&TPC);
-    PM.add(MMI);
-    Target->addPassesToEmitFile(PM, rf, nullptr,
-                                TargetMachine::CodeGenFileType::CGFT_ObjectFile,
-                                false, nullptr);
-    PM.run(module);
-    rf.flush();
-    if (foundCMD) {
-      // Prepare linking final obj
-      ldargs.push_back(tf.TmpName);
-      SmallString<128> TmpModel2;
-      path::system_temp_directory(true, TmpModel2);
-      path::append(TmpModel2, "NoctilucenceFinalObject%%%%%%%");
-      Expected<TempFile> tfOrError2 = TempFile::create(TmpModel2);
-      if (tfOrError2) {
-        TempFile &tf2 = tfOrError2.get();
-        errs() << "Emitting Final Linked Product at temporary path:"
-               << tf2.TmpName << "\n";
-        ret = tf2.TmpName;
-        ldargs.push_back("-o");
-        ldargs.push_back(tf2.TmpName);
-        ldargs.push_back("-syslibroot");
-        ldargs.push_back(SDKROOTPATH);
-        std::string ErrMsg;
-        bool failed = false;
-        sys::ExecuteAndWait(LDPath, ArrayRef<StringRef>(ldargs), llvm::None, {},
-                            0, 0, &ErrMsg, &failed);
-        if (failed || ErrMsg != "") {
-          errs() << "Linking Failed:" << ErrMsg << "\n";
-          abort();
-        }
-        Error errc = tf2.keep();
-        if (errc) {
-          errs() << errc << "\n";
-          abort();
-        }
-      } else {
-        errs() << "Creating Linking Product Failed:" << tfOrError2.takeError()
-               << "\n";
-        abort();
-      }
-      Error errc = tf.discard();
-      if (errc) {
-        errs() << errc << "\n";
-        abort();
-      }
-    } else {
-      ret = tf.TmpName;
-      Error errc = tf.keep();
-      if (errc) {
-        errs() << errc << "\n";
-        abort();
-      }
-    }
+void   HandleUniversalMachO( MachOUniversalBinary *MachO, const char **argv ) ;
 
-  } else {
-    errs() << "Emit Object File Failed:" << tfOrError.takeError() << "\n";
-  }
-  return ret;
-}
-void HandleUniversalMachO(MachOUniversalBinary *MachO, const char **argv) {
-  vector<StringRef> lipoargs;
-  lipoargs.push_back(argv[0]);
-  lipoargs.push_back("-create");
-  for (auto obj : MachO->objects()) {
-    auto Bin = &obj;
-    if (auto BinaryOrErr = Bin->getAsObjectFile()) {
-      MachOObjectFile &MachO = *BinaryOrErr.get();
-      string ret = HandleMachOObjFile(&MachO, argv);
-      if (ret == "") {
-        errs() << "Slide Handling Failed\n";
-        abort();
-      }
-      lipoargs.push_back(ret);
-    }
-  }
-  lipoargs.push_back("-output");
-  lipoargs.push_back(OutputFilename);
-  std::string ErrMsg;
-  bool failed = false;
-  sys::ExecuteAndWait("/usr/bin/lipo", ArrayRef<StringRef>(lipoargs),
-                      llvm::None, {}, 0, 0, &ErrMsg, &failed);
-  if (failed || ErrMsg != "") {
-    errs() << "Linking Failed:" << ErrMsg << "\n";
-    abort();
-  }
-}
+
 
 int main(int argc, char const *argv[]) {
-  StringRef ToolName = argv[0];
-  sys::PrintStackTraceOnErrorSignal(ToolName);
-  PrettyStackTraceProgram X(argc, argv);
-  llvm_shutdown_obj Y;
-  cl::ParseCommandLineOptions(argc, argv);
-  cl::AddExtraVersionPrinter(TargetRegistry::printRegisteredTargetsForVersion);
-  InitializeAllTargets();
-  InitializeAllTargetMCs();
-  InitializeAllAsmPrinters();
-  InitializeAllAsmParsers();
-  auto BinaryOrErr = createBinary(InputFilename);
-  if (BinaryOrErr) {
-    auto &Binary = *BinaryOrErr;
-    if (Binary.getBinary()->isMachOUniversalBinary()) {
-      MachOUniversalBinary *MOUB =
-          dyn_cast<MachOUniversalBinary>(Binary.getBinary());
-      errs() << "Found Universal MachO With" << MOUB->getNumberOfObjects()
-             << " Objects\n";
-      HandleUniversalMachO(MOUB, argv);
-    } else if (Binary.getBinary()->isMachO()) {
-      errs() << "Found Thin MachO\n";
-      string ret = HandleMachOObjFile(
-          dyn_cast<MachOObjectFile>(Binary.getBinary()), argv);
-      if (ret != "") {
-        std::error_code err = sys::fs::rename(ret, OutputFilename);
-        if (err) {
-          errs() << "Moving failed with std::error_code :" << err.message()
-                 << "\n";
-        }
-      } else {
-        errs() << "Thin MachO Handling Failed\n";
-      }
 
-    } else {
-      errs() << "Unsupported ObjectFile Format\n";
-      return -1;
-    }
-    return 0;
-  } else {
-    errs() << "LLVM BinaryParsing Failed:" << BinaryOrErr.takeError() << "\n";
-    return -1;
-  }
+	StringRef ToolName = argv[0];
+	sys::PrintStackTraceOnErrorSignal(ToolName);
+	PrettyStackTraceProgram X(argc, argv);
+	llvm_shutdown_obj Y;
+
+	cl::ParseCommandLineOptions(argc, argv);
+	cl::AddExtraVersionPrinter(TargetRegistry::printRegisteredTargetsForVersion);
+
+	InitializeAllTargets() ;
+	InitializeAllTargetMCs() ;
+	InitializeAllAsmPrinters() ;
+	InitializeAllAsmParsers() ;
+
+	auto BinaryOrErr = createBinary(InputFilename);
+	if (BinaryOrErr) {
+		auto &Binary = *BinaryOrErr;
+		if (Binary.getBinary()->isMachOUniversalBinary()) {
+
+			MachOUniversalBinary *MOUB = dyn_cast<MachOUniversalBinary>(Binary.getBinary());
+
+			errs() << "Found Universal MachO With" << MOUB->getNumberOfObjects() << " Objects\n" ;
+
+			HandleUniversalMachO(MOUB, argv);
+
+		} else if (Binary.getBinary()->isMachO()) {
+
+			errs() << "Found Thin MachO\n";
+
+			string ret = HandleMachOObjFile( dyn_cast<MachOObjectFile>(Binary.getBinary()), argv) ;
+
+			if (ret != "") {
+				std::error_code err = sys::fs::rename(ret, OutputFilename);
+				if (err) {
+					errs() << "Moving failed with std::error_code :" << err.message() << "\n" ;
+				}
+			} else {
+				errs() << "Thin MachO Handling Failed\n" ;
+			}
+
+		} else {
+
+			errs() << "Unsupported ObjectFile Format\n" ;
+
+			return -1 ;
+
+		}
+
+		return 0;
+
+	} else {
+
+		errs() << "LLVM BinaryParsing Failed:" << BinaryOrErr.takeError() << "\n" ;
+		return -1 ;
+
+	}
+}
+
+
+
+string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
+
+	if (MachO == nullptr) {
+		report_fatal_error(make_error<GenericBinaryError>("MachO is NULL!"), false);
+	}
+
+	string ret = "";
+	SMDiagnostic diag;
+	LLVMContext ctx;
+	bool foundBC = false;
+	bool foundCMD = false;
+
+	Module module("Noctilucence", ctx);
+	vector<StringRef> ldargs;
+	ldargs.push_back(argv[0]);
+
+	for (section_iterator iter = MachO->section_begin(), E = MachO->section_end() ; iter != E ; ++iter) {
+
+		SectionRef section = *iter;
+		StringRef segmentName = MachO->getSectionFinalSegmentName(section.getRawDataRefImpl());
+
+		auto sectionNameOrErr = MachO->getSectionName(section.getRawDataRefImpl() ) ;
+		if ( auto Err = sectionNameOrErr.takeError() ) {
+			errs() << "Couldn't retrieve sectionName.\n";
+			abort();
+		}
+		 auto &sectionName = *sectionNameOrErr ;
+
+		if (segmentName.equals("__LLVM") && sectionName.equals("__bundle")) {
+
+			foundBC = true;
+			foundCMD = true;
+
+			auto contentsOrErr = section.getContents();
+
+			if ( auto Err = contentsOrErr.takeError() ) {
+				errs() << "Couldn't retrieve contents.\n";
+				abort();
+			}
+			auto &contents = *contentsOrErr ;
+
+			SmallString<128> TmpModel;
+			path::system_temp_directory(true, TmpModel);
+			path::append(TmpModel, "NoctilucenceTemporaryXAR%%%%%.xar");
+			Expected<TempFile> tfOrError = TempFile::create(TmpModel);
+			if (tfOrError) {
+				TempFile &tf = tfOrError.get();
+				raw_fd_ostream rf(tf.FD, false);
+				rf << contents;
+				rf.flush();
+				errs() << "Created xar temporary file at:" << tf.TmpName << "\n";
+				xar_t xar = xar_open(tf.TmpName.c_str(), READ);
+				xar_iter_t xi = xar_iter_new();
+				for (xar_file_t xf = xar_file_first(xar, xi); xf;
+						xf = xar_file_next(xi)) {
+					char *buffer = nullptr;
+					xar_extract_tobuffer(xar, xf, &buffer);
+					assert(buffer != nullptr && "xar extraction failed");
+					char *sizeStr = xar_get_size(xar, xf);
+					long int total = atol(sizeStr);
+					free(sizeStr);
+
+					MemoryBuffer *MB =
+							MemoryBuffer::getMemBuffer(StringRef(buffer, total), "", false).get();
+					MemoryBufferRef MBR(*MB);
+
+					std::unique_ptr<Module> tmpModule ;
+					tmpModule = parseIR(MBR, diag, ctx) ;
+					assert(tmpModule.get() != nullptr && "Bitcode Parsing Failed!");
+
+					Linker::linkModules(module, std::move(tmpModule));
+
+					free(buffer);
+				}
+
+				for (xar_subdoc_t doc = xar_subdoc_first(xar); doc;
+						doc = xar_subdoc_next(doc)) {
+					if (strcmp("Ld", xar_subdoc_name(doc)) == 0) {
+						unsigned char *val = nullptr;
+						unsigned int size = 0;
+						xar_subdoc_copyout(doc, &val, &size);
+						string text((char *)val);
+						std::stringstream ss(text);
+						std::string to;
+						vector<char *> dylibs;
+						while (std::getline(ss, to, '\n')) {
+							if (to.find("<option>") != string::npos &&
+									to.find("</option>") != string::npos) {
+								size_t s1 = to.find("<option>");
+								to.erase(s1, strlen("<option>"));
+								size_t s2 = to.find("</option>");
+								to.erase(s2, strlen("</option>"));
+								to.erase(std::remove(to.begin(), to.end(), ' '), to.end());
+								char *newT = (char *)calloc(to.size() + 1, sizeof(char));
+								to.copy(newT, to.size());
+								ldargs.push_back(newT);
+							} else if (to.find("<architecture>") != string::npos &&
+									to.find("</architecture>") != string::npos) {
+								size_t s1 = to.find("<architecture>");
+								to.erase(s1, strlen("<architecture>"));
+								size_t s2 = to.find("</architecture>");
+								to.erase(s2, strlen("</architecture>"));
+								to.erase(std::remove(to.begin(), to.end(), ' '), to.end());
+								ldargs.push_back("-arch");
+								char *newT = (char *)calloc(to.size() + 1, sizeof(char));
+								to.copy(newT, to.size());
+								ldargs.push_back(newT);
+							} else if (to.find("<lib>") != string::npos &&
+									to.find("</lib>") != string::npos) {
+								size_t s1 = to.find("<lib>");
+								to.erase(s1, strlen("<lib>"));
+								size_t s2 = to.find("</lib>");
+								to.erase(s2, strlen("</lib>"));
+								to.erase(std::remove(to.begin(), to.end(), ' '), to.end());
+								to.replace(to.find("{SDKPATH}"), strlen("{SDKPATH}"),
+										SDKROOTPATH);
+								char *newT = (char *)calloc(to.size() + 1, sizeof(char));
+								to.copy(newT, to.size());
+								dylibs.push_back(newT);
+							}
+						}
+						for (char *dy : dylibs) {
+							ldargs.push_back(dy);
+						}
+						break;
+					}
+				}
+
+				xar_close(xar);
+				Error err = tf.discard();
+				if (err) {
+					errs() << err << "\n";
+					abort();
+				}
+			} else {
+				errs() << "Creating xar temporary file failed:" << tfOrError.takeError()
+            		   << "\n";
+				abort();
+			}
+			break;
+		} else if (sectionName.equals("__bitcode")) {
+
+			foundBC = true;
+
+			auto contentsOrErr = section.getContents();
+
+			if ( auto Err = contentsOrErr.takeError() ) {
+				errs() << "Couldn't retrieve contents.\n";
+				abort();
+			}
+			auto &contents = *contentsOrErr ;
+
+			MemoryBuffer *MB = MemoryBuffer::getMemBuffer(contents, "", false).get();
+			MemoryBufferRef MBR(*MB);
+			std::unique_ptr<Module> tmpModule ;
+			tmpModule = parseIR(MBR, diag, ctx);
+			assert(tmpModule.get() != nullptr && "Bitcode Parsing Failed!");
+			Linker::linkModules(module, std::move(tmpModule));
+		}
+	}
+
+	if (foundBC == false) {
+		errs() << "Bitcode not Found!\n";
+		abort();
+	}
+
+	errs()<<"Extracted Linker Flags:\n";
+
+	for(decltype(ldargs.size()) i=1;i<ldargs.size()-1;i++){
+		errs()<<ldargs[i]<<" ";
+	}
+
+	errs()<<"\n";
+
+	// TargetOptions's setup is by no mean complete, though
+	SmallString<128> TmpModel;
+	path::system_temp_directory(true, TmpModel);
+	path::append(TmpModel, "NoctilucenceTemporaryObject%%%%%%%.o");
+	Expected<TempFile> tfOrError = TempFile::create(TmpModel);
+	if (tfOrError) {
+		TempFile &tf = tfOrError.get();
+		errs() << "Created temporary object file placeholder at:" << tf.TmpName
+				<< " with FD:" << tf.FD << "\n";
+		raw_fd_ostream rf(tf.FD, false);
+		Triple tri(module.getTargetTriple());
+		DataLayout dl(&module);
+		PassManagerBuilder PMB;
+		legacy::FunctionPassManager FPM(&module);
+		legacy::PassManager MPM;
+		PMB.populateFunctionPassManager(FPM);
+		PMB.populateModulePassManager(MPM);
+		for (auto &F : module) {
+			FPM.run(F);
+		}
+		MPM.run(module);
+		VM("Noctilucence")
+		if(DumpIR){
+			std::ofstream std_file_stream(OutputFilename+".ll");
+			raw_os_ostream file_stream(std_file_stream);
+			module.print(file_stream, nullptr);
+		}
+		std::string err;
+		string arch = "";
+		const Target *target = TargetRegistry::lookupTarget(tri.getTriple(), err);
+		if (target == nullptr) {
+			errs() << err << "\n";
+			exit(-1);
+		}
+		TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
+		Options.DisableIntegratedAS = false;
+		Options.MCOptions.ShowMCEncoding = false;
+		Options.MCOptions.MCUseDwarfDirectory = false;
+		Options.MCOptions.AsmVerbose = false;
+		Options.MCOptions.PreserveAsmComments = false;
+		Options.MCOptions.SplitDwarfFile = false;
+		std::unique_ptr<TargetMachine> Target(target->createTargetMachine(
+				tri.getTriple(), "", "", Options, getRelocModel(), getCodeModel(),
+				CodeGenOpt::Default));
+		assert(Target && "Could not allocate target machine!");
+		legacy::PassManager PM;
+		TargetLibraryInfoImpl TLII(tri);
+		PM.add(new TargetLibraryInfoWrapperPass(TLII));
+		LLVMTargetMachine &LLVMTM = static_cast<LLVMTargetMachine &>(*Target);
+		MachineModuleInfoWrapperPass *MMI = new MachineModuleInfoWrapperPass(&LLVMTM);
+		TargetPassConfig &TPC = *LLVMTM.createPassConfig(PM);
+		PM.add(&TPC);
+		PM.add(MMI);
+		Target->addPassesToEmitFile(PM, rf, nullptr,
+				TargetMachine::CodeGenFileType::CGFT_ObjectFile,
+				false, nullptr);
+		PM.run(module);
+		rf.flush();
+		if (foundCMD) {
+			// Prepare linking final obj
+			ldargs.push_back(tf.TmpName);
+			SmallString<128> TmpModel2;
+			path::system_temp_directory(true, TmpModel2);
+			path::append(TmpModel2, "NoctilucenceFinalObject%%%%%%%");
+			Expected<TempFile> tfOrError2 = TempFile::create(TmpModel2);
+			if (tfOrError2) {
+				TempFile &tf2 = tfOrError2.get();
+				errs() << "Emitting Final Linked Product at temporary path:"
+						<< tf2.TmpName << "\n";
+				ret = tf2.TmpName;
+				ldargs.push_back("-o");
+				ldargs.push_back(tf2.TmpName);
+				ldargs.push_back("-syslibroot");
+				ldargs.push_back(SDKROOTPATH);
+				std::string ErrMsg;
+				bool failed = false;
+				sys::ExecuteAndWait(LDPath, ArrayRef<StringRef>(ldargs), llvm::None, {},
+						0, 0, &ErrMsg, &failed);
+				if (failed || ErrMsg != "") {
+					errs() << "Linking Failed:" << ErrMsg << "\n";
+					abort();
+				}
+				Error errc = tf2.keep();
+				if (errc) {
+					errs() << errc << "\n";
+					abort();
+				}
+			} else {
+				errs() << "Creating Linking Product Failed:" << tfOrError2.takeError()
+            		   << "\n";
+				abort();
+			}
+			Error errc = tf.discard();
+			if (errc) {
+				errs() << errc << "\n";
+				abort();
+			}
+		} else {
+			ret = tf.TmpName;
+			Error errc = tf.keep();
+			if (errc) {
+				errs() << errc << "\n";
+				abort();
+			}
+		}
+
+	} else {
+		errs() << "Emit Object File Failed:" << tfOrError.takeError() << "\n";
+	}
+	return ret;
+}
+
+
+
+void HandleUniversalMachO(MachOUniversalBinary *MachO, const char **argv) {
+
+	vector<StringRef> lipoargs ;
+	lipoargs.push_back(argv[0]) ;
+	lipoargs.push_back("-create") ;
+
+	for (auto obj : MachO->objects()) {
+		auto Bin = &obj;
+		if (auto BinaryOrErr = Bin->getAsObjectFile()) {
+			MachOObjectFile &MachO = *BinaryOrErr.get();
+			string ret = HandleMachOObjFile(&MachO, argv);
+			if (ret == "") {
+				errs() << "Slide Handling Failed\n";
+				abort();
+			}
+			lipoargs.push_back(ret);
+		}
+	}
+
+	lipoargs.push_back("-output");
+	lipoargs.push_back(OutputFilename);
+
+	std::string ErrMsg;
+	bool failed = false;
+	sys::ExecuteAndWait(
+			"/usr/bin/lipo",
+			ArrayRef<StringRef>(lipoargs),
+			llvm::None,
+			{},
+			0,
+			0,
+			&ErrMsg,
+			&failed
+	);
+	if (failed || ErrMsg != "") {
+		errs() << "Linking Failed:" << ErrMsg << "\n";
+		abort();
+	}
+
 }
