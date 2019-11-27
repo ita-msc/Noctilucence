@@ -188,30 +188,35 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 	vector<StringRef> ldargs;
 	ldargs.push_back(argv[0]);
 
+	errs() << "Iterating through sections & segments :\n";
 	for (section_iterator iter = MachO->section_begin(), E = MachO->section_end() ; iter != E ; ++iter) {
 
 		SectionRef section = *iter;
 		StringRef segmentName = MachO->getSectionFinalSegmentName(section.getRawDataRefImpl());
 
-		auto sectionNameOrErr = MachO->getSectionName(section.getRawDataRefImpl() ) ;
-		if ( auto Err = sectionNameOrErr.takeError() ) {
-			errs() << "Couldn't retrieve sectionName.\n";
+		StringRef sectionName;
+		std::error_code sectionNameErr = MachO->getSectionName( section.getRawDataRefImpl(), sectionName ) ;
+		if ( 0 != sectionNameErr.value() ) {
+			errs() << "Couldn't retrieve sectionName : " << sectionNameErr.message() << "\n";
 			abort();
 		}
-		 auto &sectionName = *sectionNameOrErr ;
 
 		if (segmentName.equals("__LLVM") && sectionName.equals("__bundle")) {
+
+			errs() << "Proceeding with segmentName : " << segmentName << " & "
+				   << "sectionName : " << sectionName << ".\n";
 
 			foundBC = true;
 			foundCMD = true;
 
-			auto contentsOrErr = section.getContents();
-
-			if ( auto Err = contentsOrErr.takeError() ) {
-				errs() << "Couldn't retrieve contents.\n";
+			StringRef contents;
+			std::error_code contentsErr = section.getContents( contents ) ;
+			if ( 0 != contentsErr.value() ) {
+				errs() << "Couldn't retrieve contents : " << contentsErr.message() << "\n";
 				abort();
 			}
-			auto &contents = *contentsOrErr ;
+
+			// errs() << "contents : " << contents << ".\n";
 
 			SmallString<128> TmpModel;
 			path::system_temp_directory(true, TmpModel);
@@ -222,7 +227,7 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 				raw_fd_ostream rf(tf.FD, false);
 				rf << contents;
 				rf.flush();
-				errs() << "Created xar temporary file at:" << tf.TmpName << "\n";
+				errs() << "Created xar temporary file at:" << tf.TmpName << ".\n";
 				xar_t xar = xar_open(tf.TmpName.c_str(), READ);
 				xar_iter_t xi = xar_iter_new();
 				for (xar_file_t xf = xar_file_first(xar, xi); xf;
@@ -241,6 +246,7 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 					std::unique_ptr<Module> tmpModule ;
 					tmpModule = parseIR(MBR, diag, ctx) ;
 					assert(tmpModule.get() != nullptr && "Bitcode Parsing Failed!");
+					errs() << "ParseIR & LinkModules for " << tmpModule.get()->getName() << "\n" ;
 
 					Linker::linkModules(module, std::move(tmpModule));
 
@@ -314,15 +320,17 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 			break;
 		} else if (sectionName.equals("__bitcode")) {
 
+			errs() << "Proceeding with segmentName : " << segmentName << " & "
+							   << "sectionName : " << sectionName << ".\n";
+
 			foundBC = true;
 
-			auto contentsOrErr = section.getContents();
-
-			if ( auto Err = contentsOrErr.takeError() ) {
-				errs() << "Couldn't retrieve contents.\n";
+			StringRef contents;
+			std::error_code contentsErr = section.getContents( contents ) ;
+			if ( 0 != contentsErr.value() ) {
+				errs() << "Couldn't retrieve contents : " << contentsErr.message() << "\n";
 				abort();
 			}
-			auto &contents = *contentsOrErr ;
 
 			MemoryBuffer *MB = MemoryBuffer::getMemBuffer(contents, "", false).get();
 			MemoryBufferRef MBR(*MB);
@@ -368,11 +376,15 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 		}
 		MPM.run(module);
 		VM("Noctilucence")
+
 		if(DumpIR){
 			std::ofstream std_file_stream(OutputFilename+".ll");
 			raw_os_ostream file_stream(std_file_stream);
 			module.print(file_stream, nullptr);
 		}
+
+		errs()<< "LookupTarget...\n";
+
 		std::string err;
 		string arch = "";
 		const Target *target = TargetRegistry::lookupTarget(tri.getTriple(), err);
@@ -380,6 +392,9 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 			errs() << err << "\n";
 			exit(-1);
 		}
+
+		errs()<< "InitTargetOptionsFromCodeGenFlags...\n";
+
 		TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
 		Options.DisableIntegratedAS = false;
 		Options.MCOptions.ShowMCEncoding = false;
@@ -391,18 +406,22 @@ string HandleMachOObjFile(MachOObjectFile *MachO, const char **argv) {
 				tri.getTriple(), "", "", Options, getRelocModel(), getCodeModel(),
 				CodeGenOpt::Default));
 		assert(Target && "Could not allocate target machine!");
-		legacy::PassManager PM;
+
+		errs()<< "PassManager... ";
+		legacy::PassManager PM; errs()<< "DONE\n";
 		TargetLibraryInfoImpl TLII(tri);
 		PM.add(new TargetLibraryInfoWrapperPass(TLII));
 		LLVMTargetMachine &LLVMTM = static_cast<LLVMTargetMachine &>(*Target);
-		MachineModuleInfoWrapperPass *MMI = new MachineModuleInfoWrapperPass(&LLVMTM);
+		MachineModuleInfo *MMI = new MachineModuleInfo( &LLVMTM ) ;
 		TargetPassConfig &TPC = *LLVMTM.createPassConfig(PM);
 		PM.add(&TPC);
 		PM.add(MMI);
 		Target->addPassesToEmitFile(PM, rf, nullptr,
 				TargetMachine::CodeGenFileType::CGFT_ObjectFile,
 				false, nullptr);
-		PM.run(module);
+		errs()<< "PM.run()... ";
+		PM.run(module); errs()<< "DONE\n";
+
 		rf.flush();
 		if (foundCMD) {
 			// Prepare linking final obj
